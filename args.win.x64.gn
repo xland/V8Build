@@ -6,16 +6,10 @@ is_component_build=false
 is_debug=false
 strip_debug_info=true
 symbol_level=0
-target_cpu = "x64"
+target_cpu="x64"
 target_os="win"
 treat_warnings_as_errors=false
-# true, unlike linux/mac's use_custom_libcxx=false (system libstdc++
-# there) - MSVC's own STL is an unsupported/broken config for building
-# V8 with clang-cl on Windows (confirmed: a real v8-users thread hit
-# the exact same "unable to build with use_custom_libcxx set to false",
-# and a V8 team member's own reply says "MSVC support will soon be
-# deprecated altogether"). repos/lo's own build.cmd needs to link
-# against libc++ too, to match, once this produces a real archive.
+# Windows 上必须为 true：clang-cl + MSVC STL 是不受支持且会编译失败的组合（v8-users 有实例，V8 团队成员也表示 MSVC 支持将废弃）
 use_custom_libcxx=true
 use_rtti=true
 use_sysroot=false
@@ -28,61 +22,27 @@ v8_enable_sandbox=false
 v8_enable_snapshot_compression=false
 v8_enable_temporal_support=false
 v8_enable_test_features=false
-# Drops the WebAssembly engine and the WebAssembly.* API entirely.
-# Compile-time gated behind V8_ENABLE_WEBASSEMBLY, so this is a real
-# removal - not "unreferenced, the linker will drop it" (most of V8's
-# JS-builtin surface is reachable transitively from Isolate::New's own
-# bootstrap, so link-time-only pruning has very little room anywhere
-# else). Measured before this repo went Windows-only: ~9.3MB across 57
-# object files of a 103.6MB archive. See doc/V8-BUILD-OPTS.md.
-# No JS execution cost either way - the only real tradeoff is that an
-# embedder can no longer instantiate a WebAssembly.Module.
+# 编译期直接移除整个 Wasm 引擎与 WebAssembly.* API（不是靠链接器裁剪）。实测约 9.3MB / 57 个 obj。详见 doc/V8-BUILD-OPTS.md
 v8_enable_webassembly=false
 v8_imminent_deprecation_warnings=false
 v8_monolithic=true
 v8_target_cpu="x64"
 v8_use_external_startup_data=false
-v8_enable_backtrace = false
-# cppgc's own caged heap is a separate reservation from
-# v8_enable_sandbox/v8_enable_pointer_compression above - defaults on
-# for every 64bit arch regardless, reserving 16GB of PROT_NONE virtual
-# address space at V8::Initialize() time unconditionally. lo never
-# creates a CppHeap, so this is pure unused overhead. Full rationale:
-# doc/V8-BUILD-OPTS.md.
+v8_enable_backtrace=false
+# cppgc 独立的 caged heap，64 位下默认开，在 V8::Initialize() 时无条件预留 16GB 虚地址；我们从不创建 CppHeap，属纯浪费。详见 doc/V8-BUILD-OPTS.md
 cppgc_enable_caged_heap=false
 cppgc_enable_pointer_compression=false
-# v8_enable_partition_alloc defaults to true once
-# v8_enable_pointer_compression_shared_cage is true (which itself
-# defaults to mirroring v8_enable_pointer_compression above). Not
-# something we were trying to change - pin off explicitly, as it was on
-# every args file this repo used to ship (real failures there:
-# partition_alloc's allocator shim vs. the platform SDK's own operator
-# new/delete declarations; glibc-only symbols vs. musl at link time).
-# Left off here for the same "don't change what wasn't set out to be
-# changed" reason, not because it was separately re-verified on Windows.
+# 保持关闭：开启后 PartitionAlloc 的 allocator shim 会与平台 SDK 的 operator new/delete 冲突。沿用"不改原本没打算改的东西"，未在 Windows 上单独复验
 v8_enable_partition_alloc=false
 
-# --- every debugging/diagnostics capability off ---
-# This repo ships this one args file, and deliberately no debug variant:
-# "debug JS" needs none (V8's Inspector is compiled in unconditionally,
-# there is no v8_enable_inspector), and is_debug on Windows swaps /MT for
-# /MTd - which a static lib drags into its embedder via /DEFAULTLIB, plus
-# implicitly defines _DEBUG and changes libc++ too. Full writeup:
-# doc/ARGS.md §4.
-#
-# Master switch for the whole family. Its real default is `is_debug`, so it
-# is already false here - pinned so that flipping is_debug (or a future V8
-# version changing the default) can't silently drag the entire derived
-# family back in.
+# --- 关闭全部调试/诊断能力 ---
+# 本仓库只出这一个 args，且刻意不提供 debug 变体：调试 JS 不需要（Inspector 无条件编译，无 v8_enable_inspector 开关）；
+# 而 is_debug 在 Windows 上会把 /MT 换成 /MTd，静态库又通过 /DEFAULTLIB 把该选择拖给使用方。详见 doc/ARGS.md §4
+# 总闸：真实默认值是 is_debug，这里本已为 false；显式钉住以防翻转 is_debug 或未来 V8 改默认时把整族开关悄悄带回
 v8_enable_debugging_features=false
-# gni/v8.gni asserts `!v8_enable_debugging_features ||
-# v8_enable_verification_features`, so with debugging off this has to be off
-# too. It is what most of the flags below actually derive from.
+# gni/v8.gni 有 assert(!debugging || verification)，调试关闭时它也必须关；下面多数开关实际由它派生
 v8_enable_verification_features=false
-# Everything from here to v8_enable_slow_tracing is derived from the two
-# switches above (or from is_debug) and is therefore already off - pinned
-# purely so the release/debug pair reads as an explicit, complete set.
-# Per-line notes only where the real default is NOT is_debug.
+# 以下均由上面两开关或 is_debug 派生，本已为 false；显式列出只为让这份配置自成完整一套
 v8_enable_v8_checks=false
 v8_enable_verify_heap=false
 v8_enable_verify_write_barriers=false
@@ -101,30 +61,14 @@ v8_always_enable_maglev_graph_labeller=false
 v8_enable_heap_snapshot_verify=false
 v8_enable_memory_accounting_checks=false
 cppgc_enable_verify_heap=false
-# Real default is 1, i.e. V8's LOG() statements are compiled in; 2 is what
-# V8 picks when verification features/dcheck are on, and 0 is what
-# is_official_build picks. 0 drops them entirely - smaller and faster, at
-# the cost of losing V8's own log output.
+# 真实默认值是 1（编进 V8 的 LOG 语句）；0 完全移除，体积和速度双收，代价是拿不到 V8 自身的日志输出
 v8_logging_level=0
-# Real default is `!build_with_chromium`, i.e. TRUE for a standalone build
-# like this one - a pure diagnostic facility (Maglev graph printing) nothing
-# else depends on. Off here.
+# 真实默认值是 !build_with_chromium，即独立构建下为 true。纯诊断设施（打印 Maglev 图），无其他依赖
 v8_enable_maglev_graph_printer=false
-# Real default is `(is_win || is_mac) && !v8_use_perfetto` - TRUE here.
-# Windows ETW event tracing. Runtime-gated twice over: it needs this build
-# flag AND the --enable-system-instrumentation runtime flag (stated in
-# src/libplatform/tracing/recorder.h's own comment), so there is no
-# steady-state cost either way - only size. Off here.
+# 真实默认值是 (is_win || is_mac) && !v8_use_perfetto，即此处为 true。运行时双重开关（需本标志 + --enable-system-instrumentation），无稳态开销，只省体积
 v8_enable_system_instrumentation=false
-# Real default is `is_win` - TRUE here. Adds the 7
-# src/diagnostics/etw-*-win.cc files plus advapi32.lib. Also runtime-gated:
-# ETWJITInterface::EventHandler's first line is
-# `if (!isolate->IsETWTracingEnabled()) return;`, so nothing is emitted
-# unless an ETW session is actively tracing - no steady-state cost, only the
-# ability to symbolicate JIT frames in ETW/WPA. Off here.
+# 真实默认值是 is_win，即此处为 true。多编入 7 个 src/diagnostics/etw-*-win.cc 并链 advapi32.lib；同样运行时开关（IsETWTracingEnabled），无稳态开销
 v8_enable_etw_stack_walking=false
-# Startup-time wins; already the derived defaults given pointer compression
-# (v8_enable_static_roots even asserts pointer compression is on). Pinned
-# per doc/V8-BUILD-OPTS.md's "worth pinning explicitly" note.
+# 启动提速项：开启指针压缩后本已是派生默认值（static_roots 还 assert 要求指针压缩开启）。按 doc/V8-BUILD-OPTS.md 的建议显式钉住
 v8_enable_static_roots=true
 v8_enable_short_builtin_calls=true
