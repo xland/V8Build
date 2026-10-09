@@ -1,0 +1,9 @@
+name: build and publish v8 libs
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml

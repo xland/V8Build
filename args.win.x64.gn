@@ -1,0 +1,130 @@
+clang_use_chrome_plugins=false
+dcheck_always_on=false
+enable_rust=false
+is_clang=true
+is_component_build=false
+is_debug=false
+strip_debug_info=true
+symbol_level=0
+target_cpu = "x64"
+target_os="win"
+treat_warnings_as_errors=false
+# true, unlike linux/mac's use_custom_libcxx=false (system libstdc++
+# there) - MSVC's own STL is an unsupported/broken config for building
+# V8 with clang-cl on Windows (confirmed: a real v8-users thread hit
+# the exact same "unable to build with use_custom_libcxx set to false",
+# and a V8 team member's own reply says "MSVC support will soon be
+# deprecated altogether"). repos/lo's own build.cmd needs to link
+# against libc++ too, to match, once this produces a real archive.
+use_custom_libcxx=true
+use_rtti=true
+use_sysroot=false
+v8_deprecation_warnings=false
+v8_enable_builtins_optimization=true
+v8_enable_gdbjit=false
+v8_enable_i18n_support=false
+v8_enable_pointer_compression=true
+v8_enable_sandbox=false
+v8_enable_snapshot_compression=false
+v8_enable_temporal_support=false
+v8_enable_test_features=false
+# Drops the WebAssembly engine and the WebAssembly.* API entirely.
+# Compile-time gated behind V8_ENABLE_WEBASSEMBLY, so this is a real
+# removal - not "unreferenced, the linker will drop it" (most of V8's
+# JS-builtin surface is reachable transitively from Isolate::New's own
+# bootstrap, so link-time-only pruning has very little room anywhere
+# else). Measured before this repo went Windows-only: ~9.3MB across 57
+# object files of a 103.6MB archive. See doc/V8-BUILD-OPTS.md.
+# No JS execution cost either way - the only real tradeoff is that an
+# embedder can no longer instantiate a WebAssembly.Module.
+v8_enable_webassembly=false
+v8_imminent_deprecation_warnings=false
+v8_monolithic=true
+v8_target_cpu="x64"
+v8_use_external_startup_data=false
+v8_enable_backtrace = false
+# cppgc's own caged heap is a separate reservation from
+# v8_enable_sandbox/v8_enable_pointer_compression above - defaults on
+# for every 64bit arch regardless, reserving 16GB of PROT_NONE virtual
+# address space at V8::Initialize() time unconditionally. lo never
+# creates a CppHeap, so this is pure unused overhead. Full rationale:
+# doc/V8-BUILD-OPTS.md.
+cppgc_enable_caged_heap=false
+cppgc_enable_pointer_compression=false
+# v8_enable_partition_alloc defaults to true once
+# v8_enable_pointer_compression_shared_cage is true (which itself
+# defaults to mirroring v8_enable_pointer_compression above). Not
+# something we were trying to change - pin off explicitly, as it was on
+# every args file this repo used to ship (real failures there:
+# partition_alloc's allocator shim vs. the platform SDK's own operator
+# new/delete declarations; glibc-only symbols vs. musl at link time).
+# Left off here for the same "don't change what wasn't set out to be
+# changed" reason, not because it was separately re-verified on Windows.
+v8_enable_partition_alloc=false
+
+# --- every debugging/diagnostics capability off ---
+# This repo ships this one args file, and deliberately no debug variant:
+# "debug JS" needs none (V8's Inspector is compiled in unconditionally,
+# there is no v8_enable_inspector), and is_debug on Windows swaps /MT for
+# /MTd - which a static lib drags into its embedder via /DEFAULTLIB, plus
+# implicitly defines _DEBUG and changes libc++ too. Full writeup:
+# doc/ARGS.md §4.
+#
+# Master switch for the whole family. Its real default is `is_debug`, so it
+# is already false here - pinned so that flipping is_debug (or a future V8
+# version changing the default) can't silently drag the entire derived
+# family back in.
+v8_enable_debugging_features=false
+# gni/v8.gni asserts `!v8_enable_debugging_features ||
+# v8_enable_verification_features`, so with debugging off this has to be off
+# too. It is what most of the flags below actually derive from.
+v8_enable_verification_features=false
+# Everything from here to v8_enable_slow_tracing is derived from the two
+# switches above (or from is_debug) and is therefore already off - pinned
+# purely so the release/debug pair reads as an explicit, complete set.
+# Per-line notes only where the real default is NOT is_debug.
+v8_enable_v8_checks=false
+v8_enable_verify_heap=false
+v8_enable_verify_write_barriers=false
+v8_enable_verify_csa=false
+v8_enable_slow_dchecks=false
+v8_enable_debug_code=false
+v8_code_comments=false
+v8_enable_snapshot_code_comments=false
+v8_enable_snapshot_native_code_counters=false
+v8_enable_slow_tracing=false
+v8_enable_disassembler=false
+v8_enable_object_print=false
+v8_enable_trace_maps=false
+v8_enable_regexp_diagnostics=false
+v8_always_enable_maglev_graph_labeller=false
+v8_enable_heap_snapshot_verify=false
+v8_enable_memory_accounting_checks=false
+cppgc_enable_verify_heap=false
+# Real default is 1, i.e. V8's LOG() statements are compiled in; 2 is what
+# V8 picks when verification features/dcheck are on, and 0 is what
+# is_official_build picks. 0 drops them entirely - smaller and faster, at
+# the cost of losing V8's own log output.
+v8_logging_level=0
+# Real default is `!build_with_chromium`, i.e. TRUE for a standalone build
+# like this one - a pure diagnostic facility (Maglev graph printing) nothing
+# else depends on. Off here.
+v8_enable_maglev_graph_printer=false
+# Real default is `(is_win || is_mac) && !v8_use_perfetto` - TRUE here.
+# Windows ETW event tracing. Runtime-gated twice over: it needs this build
+# flag AND the --enable-system-instrumentation runtime flag (stated in
+# src/libplatform/tracing/recorder.h's own comment), so there is no
+# steady-state cost either way - only size. Off here.
+v8_enable_system_instrumentation=false
+# Real default is `is_win` - TRUE here. Adds the 7
+# src/diagnostics/etw-*-win.cc files plus advapi32.lib. Also runtime-gated:
+# ETWJITInterface::EventHandler's first line is
+# `if (!isolate->IsETWTracingEnabled()) return;`, so nothing is emitted
+# unless an ETW session is actively tracing - no steady-state cost, only the
+# ability to symbolicate JIT frames in ETW/WPA. Off here.
+v8_enable_etw_stack_walking=false
+# Startup-time wins; already the derived defaults given pointer compression
+# (v8_enable_static_roots even asserts pointer compression is on). Pinned
+# per doc/V8-BUILD-OPTS.md's "worth pinning explicitly" note.
+v8_enable_static_roots=true
+v8_enable_short_builtin_calls=true

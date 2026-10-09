@@ -1,0 +1,39 @@
+name: build and publish v8 libs for release
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    needs: build
+    name: publish ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: include.tar.gz
+            content_type: application/gzip
+          - asset: libv8_monolith-win-x64.zip
+            content_type: application/zip
+          - asset: gen-win-x64.zip
+            content_type: application/zip
+          - asset: libcxx-headers-win-x64.zip
+            content_type: application/zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+      - name: upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ matrix.asset }}
+          asset_name: ${{ matrix.asset }}
+          asset_content_type: ${{ matrix.content_type }}

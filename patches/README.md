@@ -1,0 +1,262 @@
+# patches
+
+Small, real patches against V8's own source, applied automatically to
+the Windows build job right after the checkout is cached (`.github/
+workflows/build.yml`'s "apply v8 patches" step) and before
+anything compiles. Standard unified diffs, `-p1` layout (`a/`/`b/`
+prefixes, matching `git diff`'s own default) — applied with `git apply`,
+which fails the whole step loudly if a patch doesn't apply cleanly
+(upstream source shape changed, wrong V8 version, etc.) rather than
+silently skipping it.
+
+**To add a patch:** drop a `.patch` file here. Every file matching
+`patches/*.patch` gets applied, every run — there's no
+per-platform or per-version selection mechanism (not needed yet; add one
+if a patch ever needs to apply to only some builds).
+
+**To remove/disable a patch:** delete the file, or rename it out of the
+`*.patch` glob (e.g. append `.obsolete-at-<version>` — real precedent
+below, `14.7-bigint-missing-memory-include.patch.obsolete-at-14.9`) if
+you want to keep the file and its history around without it being
+applied. Simplest possible revert: `git rm patches/<name>.patch`.
+
+**Generating a new patch**, from a real before/after: `diff -u
+<upstream-file> <fixed-file> | sed 's|^--- <upstream-file>|--- a/<path/in/v8/tree>|; s|^+++ <fixed-file>|+++ b/<path/in/v8/tree>|'`
+— or, with a real local `v8/` checkout already patched by hand, just
+`git -C v8 diff -- <path>` and copy the output here directly (already in
+the right `a/`/`b/` format). Test it actually applies before committing:
+`git -C v8 apply --check patches/<name>.patch`.
+
+## current
+
+- **[`15.3-cfunctioninfo-has-receiver-kno.patch`](15.3-cfunctioninfo-has-receiver-kno.patch)**
+  — not a bug fix like the others here, a real feature addition: adds
+  `CFunctionInfo::HasReceiver` (`kYes`/`kNo`, defaulting to `kYes` —
+  fully backward compatible, no behavior change for any existing fast-
+  call user) so an embedder can register a plain C function pointer as a
+  V8 Fast API Call target without V8 forcing a wasted JS-receiver
+  parameter into it. Motivating case: `lo`'s own FFI/ABI dispatch calls
+  free-standing C functions with no "object" concept at all — the
+  receiver V8's Fast API Calls convention always prepends exists to
+  support Blink/DOM-style wrapped-object method dispatch (see the
+  worked example in `include/v8-fast-api-calls.h`'s own doc comment),
+  which was never `lo`'s shape. Confirmed this isn't a novel idea:
+  Node.js tried exactly this upstream
+  ([nodejs/node#63140](https://github.com/nodejs/node/pull/63140),
+  closed) before landing on a different approach for their own
+  `--experimental-ffi`
+  ([nodejs/node#63068](https://github.com/nodejs/node/pull/63068),
+  merged) — runtime-JIT'd trampolines that strip the receiver in
+  userland instead of patching V8. `lo` already has the equivalent
+  JIT-trampoline machinery (`lib/asm.js`'s `compile_fastcall`/
+  `compile_slowcall`, doing the identical register-shift-to-strip-
+  receiver trick) — this patch is the alternative bet: pay a small,
+  mechanical V8-side patch-maintenance cost instead of maintaining a
+  full runtime code generator for the common numeric/pointer-only case.
+  Adapted from #63140's real diff (touching `include/v8-fast-api-calls.h`,
+  `src/api/api.cc`, `src/compiler/fast-api-calls.cc`,
+  `src/compiler/js-call-reducer.cc`) — not copied verbatim, since #63140
+  was written against a different, unstated V8 version; hand-adapted
+  against this project's actual target (confirmed identical to
+  `branch-heads/15.2`'s real source in every region this patch touches,
+  fetched directly, not assumed) and verified with `git apply --check`
+  against a fresh `branch-heads/15.3` checkout before adding here, plus
+  `tools/check-patches.js 15.3` reporting it clean alongside the other
+  current patches.
+  **Not yet verified, real open questions**: (1) whether Maglev has its
+  own independent fast-API-call lowering that would also need this
+  change — this patch only touches `js-call-reducer.cc`, which is
+  Turbofan's; (2) `ReduceFastApiCall`'s slow-path fallback arithmetic
+  (`slow_arg_count`) was left unconditionally including a receiver slot,
+  on the reasoning that the slow builtin call (`CallApiCallbackOptimizedXXX`)
+  has its own separate calling convention unrelated to the fast
+  signature's shape — a judgment call, not confirmed against real V8
+  compiler behavior; (3) never compile-tested against a real V8 build —
+  this sandbox can't build V8 itself, so this is verified only as "a
+  clean, mechanical patch that applies to real source," not as "V8
+  compiles and runs correctly with it." Needs a real build (via
+  `tools/build-windows-local.js`/CI) before being trusted in production.
+- **[`14.8-object-h-missing-nullptr-t.patch`](14.8-object-h-missing-nullptr-t.patch)**
+  — `include/v8-object.h` at `branch-heads/14.8` uses a bare `nullptr_t`
+  (`AccessorNameGetterCallback getter, nullptr_t setter = nullptr` at
+  line 408) with no `#include <cstddef>` anywhere in its own include
+  chain — real, confirmed build failure on this project's clang+libc++
+  toolchain (`error: unknown type name 'nullptr_t'; did you mean
+  'std::nullptr_t'?`), not guessed: fetched the real
+  `branch-heads/14.8` header directly and confirmed the missing include.
+  `include/v8-template.h` hits the exact same error at ~15 more call
+  sites — but it already has `#include <cstddef>` itself and still
+  fails, because `<cstddef>` only guarantees `std::nullptr_t`, not an
+  unqualified `::nullptr_t` in the global/`v8` namespace (some
+  toolchains inject that as an extension, this one doesn't). Since
+  `v8-template.h` includes `v8-object.h` first, fixing it there once
+  covers both files rather than patching every call site individually:
+  adds `#include <cstddef>` plus `using std::nullptr_t;` inside
+  `namespace v8 { ... }`, right after the opening brace. Verified the
+  fix compiles in isolation (a standalone `using std::nullptr_t;`
+  translation unit) before trusting it; not yet confirmed against a
+  real CI run.
+- **[`14.8-template-h-cast-function-type-mismatch.patch`](14.8-template-h-cast-function-type-mismatch.patch)**
+  — **regenerated for 14.9** (2026-08-22): `tools/check-patches.js`
+  caught this one failing to apply too, in the same 14.9 check that found
+  both obsolete patches above. Unlike those, this was a real context
+  shift, not a fix that disappeared — confirmed via `git apply --check -C1`
+  (reduced context) succeeding where the full-context check failed,
+  a reliable signal for "same fix, context moved" vs. "fix no longer
+  needed" (tested against all three real 14.9 failures this session,
+  not assumed). Root cause: `branch-heads/14.9` inserted a new
+  `V8_DEPRECATE_SOON(...)` annotation directly above each of the 4 call
+  sites this patch touches, shifting their line numbers without changing
+  the underlying cast-mismatch bug at all. Regenerated by applying the
+  old patch with reduced context against fresh 14.9 source to derive the
+  fixed file, then diffing that against pristine 14.9 to produce a new,
+  full-context-clean patch — verified applying cleanly against a
+  completely fresh `branch-heads/14.9` checkout before replacing the old
+  file. Original 14.8 story below still describes the underlying bug and
+  fix correctly, only the line numbers changed.
+  `include/v8-template.h` at `branch-heads/14.8` has a real, live V1→V2
+  callback-signature migration in progress (`TODO(crbug.com/348660658):
+  cleanup once migration ... is done`). Its own compatibility shims
+  (`NamedPropertyHandlerConfiguration`/`IndexedPropertyHandlerConfiguration`'s
+  private `ConvertSetter`/`ConvertDefiner` helpers) convert between the
+  old and new callback typedefs — which differ only in their
+  `PropertyCallbackInfo<void>` vs `PropertyCallbackInfo<Boolean>`
+  template argument — via a plain functional-style cast
+  (`return NamedPropertySetterCallbackV2(value);`, 4 call sites: both
+  `Named*` converters at lines 760/772, both mirrored `Indexed*`
+  converters at lines 887/899). Real, confirmed build failure on
+  `windows (x64)`'s real CI toolchain (`error: cast from
+  'NamedPropertySetterCallback' ... to 'NamedPropertySetterCallbackV2'
+  ... converts to incompatible function type
+  [-Werror,-Wcast-function-type-mismatch]`) — this fires just from
+  *including* `v8.h` (these are plain non-template static member
+  functions, type-checked at class-definition time, not deferred to
+  first use), so any embedder including V8's headers on a toolchain with
+  this warning enabled hits it, not just `lo`. Confirmed empirically in
+  this sandbox that neither a C-style/functional cast nor a *direct*
+  `reinterpret_cast` between the two function-pointer types silences
+  this specific warning — only routing through an intermediate `void*`
+  does (`reinterpret_cast<NamedPropertySetterCallbackV2>(reinterpret_cast<void*>(value))`),
+  the standard idiom for an intentional, ABI-safe function-pointer
+  reinterpretation that this specific clang warning's heuristic doesn't
+  otherwise recognize. Verified the isolated pattern compiles clean with
+  `-Wcast-function-type-mismatch -Werror` before trusting it.
+
+  **Regenerated again for 15.2** (2026-08-25): `tools/check-patches.js
+  15.2` caught this one failing to apply again — `error: patch failed:
+  include/v8-template.h:759`. Same shape of drift as the 14.9
+  regeneration above, confirmed the same way: `git apply --check -C1`
+  (reduced context) succeeded where the full-context check failed, and
+  fetching `branch-heads/15.2`'s real `include/v8-template.h` directly
+  showed the same 4 `ConvertSetter`/`ConvertDefiner` call sites still
+  doing the identical bare functional-style cast
+  (`return NamedPropertySetterCallbackV2(value);`, etc.) — upstream
+  still hasn't fixed the underlying cast-mismatch bug itself, just kept
+  shifting the surrounding lines (this time: a new
+  `ConvertSetter(NamedPropertySetterCallbackV2 value) { return value; }`
+  overload inserted just above the affected one, and the annotation
+  above each site changed from `V8_DEPRECATE_SOON` to `V8_DEPRECATED` -
+  a real, separate deprecation-tier bump, not something this patch needs
+  to care about). Regenerated the same way as before: applied the old
+  patch with reduced context against fresh 15.2 source to derive the
+  fixed file, diffed that against a pristine, independently re-fetched
+  copy of the same file to produce a new patch, and verified *that*
+  applies cleanly with full context against yet another fresh
+  `branch-heads/15.2` checkout (not just the same working copy already
+  used to derive it) before replacing the old file - confirmed via
+  `tools/check-patches.js 15.2` reporting both patches clean afterward.
+
+## disproven
+
+- **[`14.9-disable-safe-libcxx-windows-torque-offset-fix.patch.disproven`](14.9-disable-safe-libcxx-windows-torque-offset-fix.patch.disproven)**
+  — **tried, disproven, parked** (2026-08-22) — renamed out of the
+  `*.patch` glob like the obsolete ones above, but for a different
+  reason: this isn't superseded by an upstream fix, it's a tested
+  hypothesis that turned out to be wrong, kept because it may still be
+  useful reference if a related libc++-on-Windows issue comes up later.
+  Targeted the real,
+  unresolved Windows Torque/`JSAtomicsMutex` bug documented in
+  `PLAN.md` task 40: a `static_assert` in
+  `gen/torque-generated/src/objects/js-atomics-synchronization-tq.cc`
+  fails because Torque's own internally-computed field offset for
+  `JSAtomicsMutex::owner_thread_id_` (40) doesn't match what the real
+  compiler produces via `offsetof()` (36) — Windows-only, root-caused to
+  upstream commit `756c6901c3` ("Port `AlwaysSharedSpaceJSObject`
+  subtree to `HeapObjectLayout`"), no upstream fix on this branch.
+  Windows is the *only* platform in this build matrix with
+  `use_custom_libcxx=true` (confirmed: Linux's real compile flags don't
+  even mention `_LIBCPP_HARDENING_MODE`, Windows's show
+  `_LIBCPP_HARDENING_MODE_EXTENSIVE`), traced to
+  `use_safe_libcxx = use_custom_libcxx && enable_safe_libcxx`
+  (`build/config/compiler/BUILD.gn` in the pinned `chromium/src/build`
+  DEPS) with `enable_safe_libcxx` hardcoded `true` in V8's own
+  `build_overrides/build.gni:37`. Patch flipped it to `false` — pushed,
+  watched a real CI run
+  (https://github.com/just-js/v8/actions/runs/32551553356/job/96979028041):
+  confirmed the patch applied and `_LIBCPP_HARDENING_MODE_NONE` really
+  did take effect in the actual compile command, and the static
+  assertion still failed with the exact same offsets (`40 == 36`).
+  Clean negative result — libc++ hardening mode is not the cause.
+  Reverted rather than kept as a harmless no-op, since it wasn't
+  actually fixing anything. Next real lead: read Torque's own C++
+  layout-computation source (`src/torque/`) directly, or find an
+  existing upstream bug report for `756c6901c3` first.
+- **[`14.9-remove-jsatomicsmutex-offset-backcompat-shim.patch.disproven`](14.9-remove-jsatomicsmutex-offset-backcompat-shim.patch.disproven)**
+  — **tried, disproven, parked (2026-08-22)**, same treatment as the
+  hardening-mode patch above. A real upstream fix, found and backported,
+  not authored from scratch — but tested against real CI and it didn't
+  help. Same task 40 bug as above (`branch-heads/14.9`
+  Windows Torque `static_assert` failure). Checked V8 mainline's history
+  for `src/objects/js-atomics-synchronization.h` past `756c6901c3`
+  (nothing on `branch-heads/14.9` itself, but mainline has moved on) and
+  found `6da197431106` ("[objects] Inline back-compat `Foo::kBarOffset`
+  shims", same bug ID `42202654` as the original root-cause commit) — a
+  ~180-file global refactor removing back-compat `static const int
+  Foo::kBarOffset` shims left over from the `HeapObjectLayout` port,
+  inlining `offsetof(Foo, bar_)` directly at each use site instead. Its
+  own commit message explains our exact failure mode: those shims were
+  `inline constexpr` symbols defined out-of-line (needed since
+  `offsetof`/`sizeof` can't run on a still-incomplete type inside the
+  class body) — a real C++ cross-translation-unit initialization-order
+  subtlety that apparently only manifests under MSVC-mode compilation.
+  Extracted and tested *only* the 2-file, ~30-line slice touching our
+  classes (`js-atomics-synchronization.h`/`-inl.h`) rather than
+  cherry-picking the full ~180-file commit — checked directly that the
+  small slice applies cleanly with full context against a fresh
+  `branch-heads/14.9` checkout (confirmed, not assumed) before deciding
+  against the full cherry-pick, which would very likely conflict given
+  how far `branch-heads/14.9` and mainline have diverged elsewhere over
+  two months of separate development for the other ~178 unrelated files.
+  **Real, open uncertainty**: our actual CI failure has *two* static
+  assertions — `JSAtomicsMutex::kOwnerThreadIdOffset` (this patch
+  directly addresses it) and `JSAtomicsCondition::kOptionalPaddingOffset`
+  (checked directly: no C++-side shim exists for this one anywhere in
+  the header or `-inl.h` — it's purely Torque-generated from the `.tq`
+  file's `@if(TAGGED_SIZE_8_BYTES) optional_padding: uint32;` field, so
+  this specific upstream commit doesn't touch it at all). Both fields
+  are the first-and-only field in their respective subclasses, right
+  after the same shared `JSSynchronizationPrimitive` base, and both show
+  the identical 4-byte discrepancy (40 vs 36) — suggestive that both
+  trace back to the same base-class offset computation and fixing one
+  might transitively fix the other.
+
+  **Tested against real CI, both predictions wrong**: pushed, watched
+  the run
+  (https://github.com/just-js/v8/actions/runs/32552556466/job/96981544753):
+  patch applied correctly, and **both** static assertions still failed,
+  byte-for-byte identical to before — including the exact one
+  (`JSAtomicsMutex::kOwnerThreadIdOffset`) this patch's C++-side symbol
+  removal directly targeted. Real, clarifying negative result: the
+  `static_assert` lives *inside* Torque-generated code
+  (`gen/torque-generated/.../js-atomics-synchronization-tq.cc`), and
+  since the `.tq` source itself was untouched by the backported
+  commit, removing the redundant C++ back-compat symbol never actually
+  touched whatever Torque's own compiler independently computes for its
+  side of the comparison. The upstream commit was a genuine fix for a
+  *different* problem (cleanup of now-redundant symbols left over from
+  the `HeapObjectLayout` port, for callers that used to need them) —
+  not this static assertion's actual root cause. That root cause lives
+  entirely inside Torque's own C++ compiler source (`src/torque/`),
+  untouched by either hypothesis tried so far. Parked alongside the
+  hardening-mode patch for the same reason: real, disproven lead, kept
+  for reference.

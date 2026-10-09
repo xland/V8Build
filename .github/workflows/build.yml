@@ -1,0 +1,367 @@
+name: build v8 libs (reusable)
+on:
+  workflow_call:
+
+env:
+  V8_VERSION: "15.3"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  build-windows:
+    name: windows
+    # Switched to windows-2025 (VS2026) 2026-08-22, matching repos/lo's
+    # own Windows job. The previous windows-2022 pin's stated reason
+    # (vs_toolchain.py not recognizing VS2026) is now stale - checked
+    # directly against the exact build/ repo commit V8_VERSION's own
+    # DEPS actually pins (not guessed): its vs_toolchain.py already
+    # lists '2026' first in MSVS_VERSIONS ("The VS version in our
+    # packaged toolchain"), with real path/edition detection for it
+    # (MSVC_LOCATION, MSVC_EDITIONS including BuildTools). Also matches
+    # where upstream is actually heading: Chromium's own current build
+    # docs state VS2026 (>=18.0.0) is required now, not just supported,
+    # and Node.js added real VS2026 build support this session's own
+    # timeframe (nodejs/node#60727) - VS2022 is the aging option here,
+    # not VS2026 the risky one.
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: setup env
+        shell: pwsh
+        run: |
+          echo "${{ github.workspace }}/depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "DEPOT_TOOLS_WIN_TOOLCHAIN=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: git config for depot_tools
+        run: |
+          git config --global depot-tools.allowGlobalGitConfig true
+          # Git for Windows' installer defaults to core.autocrlf=true,
+          # so gclient sync's checkout of v8 below gets CRLF line
+          # endings - but patches/*.patch are plain LF (authored on a
+          # Linux sandbox), and git apply matches context byte-for-byte,
+          # so every patch fails to apply on Windows specifically.
+          # Confirmed via direct reproduction: the same patch applied
+          # against a CRLF copy of the real upstream file fails with the
+          # exact error seen in CI ("patch does not apply"); against LF
+          # it applies cleanly. Forcing this off here, before any clone,
+          # keeps the Windows checkout LF like the other platforms.
+          git config --global core.autocrlf false
+      # depot_tools itself is a much smaller/faster clone than v8 (the
+      # real cost is gclient sync below), but still a real network op
+      # worth caching. Fixed key (not keyed on V8_VERSION - depot_tools
+      # itself is independent of which V8 version we're building), bump
+      # the -v2 suffix manually if it ever needs a forced refresh.
+      #
+      # DEPOT_TOOLS_UPDATE=0 was tried here too, to also skip
+      # depot_tools' own self-update check (this session hit one
+      # transient failure there: "depot_tools update failed. Conflict
+      # in ... ruff_chromium") - reverted: it broke something depot_tools'
+      # own git-cache mechanism depends on (real, reproducible
+      # `FileNotFoundError` deep in git_cache.py's GetCachePath(), not
+      # present before this env var was added). Not worth the
+      # uncertainty for a minor speed/flakiness win - the actual
+      # expensive, worth-caching part is gclient sync below, not this.
+      - name: restore depot_tools cache
+        id: depot-tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: depot_tools
+          key: depot_tools-windows-v2
+      - name: clone depot_tools
+        if: steps.depot-tools-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+      # actions/cache's combined action only saves at end-of-job, and
+      # explicitly skips saving if *any* step in the job failed -
+      # confirmed directly (this session's own previous run: "Post
+      # cache v8 checkout" showed completed/skipped despite the clone
+      # itself succeeding, because a later, unrelated step - compile -
+      # failed). Explicit save right after the clone succeeds instead,
+      # decoupled from whatever happens later in the job. Same fix
+      # applied to the v8 checkout cache below.
+      - name: save depot_tools cache
+        if: steps.depot-tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: depot_tools
+          key: depot_tools-windows-v2
+      # depot_tools is disposable tooling, never intentionally edited -
+      # always force the checkout to a pristine state before letting
+      # `gclient` run its own self-update. Needed because the cache key
+      # above is fixed/never expires on its own: the cached checkout gets
+      # stale relative to upstream depot_tools over time, and depot_tools'
+      # self-update (a `git checkout` to the newer upstream commit) then
+      # refuses to proceed once it thinks tracked files differ from the
+      # target commit - real, reproduced failure from a stale cache hit:
+      # "depot_tools update failed. Conflict in .../depot_tools ... Your
+      # local changes to the following files would be overwritten by
+      # checkout: git_cl.py, infra/config/recipes.cfg, ..." - and once it
+      # starts happening it blocks every subsequent run identically,
+      # re-run or not, until the cache is force-refreshed. no-op on a
+      # freshly cloned checkout, so safe to always run regardless of
+      # cache hit/miss.
+      - name: clean depot_tools checkout
+        run: |
+          git -C depot_tools reset --hard
+          git -C depot_tools clean -fd
+      - name: init depot_tools
+        run: |
+          gclient
+      # branch-heads/$V8_VERSION is meant to be stable once cut (same
+      # trade-off already accepted for the linux-arm64 clang-bootstrap
+      # cache) - this session alone has re-run this exact fetch+sync
+      # something like 5-6 times against the same 14.5 pin while
+      # iterating on the Windows-only libc++ linking issue
+      # (task 40/LO-WINDOWS.md), each time paying the full ~5-8 minute
+      # cost for no reason. Cached *before* the libc++ patch step below,
+      # so the patch (which isn't idempotent - it errors out loudly if
+      # its target block is already patched) always runs against a
+      # known-unpatched tree, whether freshly synced or freshly
+      # restored from cache. Real unconfirmed risk: a full V8 checkout
+      # plus its buildtools/third_party DEPS could be several GB -
+      # GitHub Actions caches have historically had a ~10GB per-entry
+      # limit. Worth checking the actual size after this first
+      # cache-populating run rather than assuming it fits.
+      - name: restore v8 checkout cache
+        id: v8-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: v8
+          key: v8-src-windows-${{ env.V8_VERSION }}-v1
+      - name: prepared v8 build environment
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        run: |
+          fetch v8
+          cd v8
+          git checkout branch-heads/$V8_VERSION
+          gclient sync
+      # explicit save right after sync succeeds, not deferred to
+      # end-of-job - see the depot_tools cache comment above for why
+      # (actions/cache's combined action skips saving if any later,
+      # unrelated step fails - confirmed directly, not guessed, from
+      # this exact job the first time around).
+      - name: save v8 checkout cache
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: v8
+          key: v8-src-windows-${{ env.V8_VERSION }}-v1
+      - name: apply v8 patches
+        run: |
+          for p in patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "applying $p"
+            git -C v8 apply "../$p"
+          done
+      - name: patch build/config/win NTDDI_VERSION for installed Windows SDK
+        run: |
+          # Real CI failure (just-js/v8 run 33226791928, windows x64, V8
+          # 15.3), different from the SDK_VERSION fix above (that one's
+          # confirmed working - this build now gets past `gn gen` and
+          # into real compilation before failing here). build/config/win/
+          # BUILD.gn (fetched fresh by `gclient sync` above, from the
+          # revision V8 15.3's own DEPS pins for `build` - not something
+          # patches/*.patch can target, same reasoning as the libc++
+          # patches below) sets `-DNTDDI_VERSION=NTDDI_WIN11_BR`, a
+          # Windows-SDK-release identifier newer than what SDK 10.0.26100.0
+          # (the version actually installed on this runner - see
+          # setup_toolchain.py's SDK_VERSION, same patch file as above)
+          # defines in its own sdkddkver.h. An undefined macro used in an
+          # `#if NTDDI_VERSION >= ...` comparison evaluates to 0 rather
+          # than erroring, so every NTDDI_VERSION-gated declaration in the
+          # Windows SDK headers silently disappears - confirmed real
+          # symptom: `fileapi.h(1081,10): error: unknown type name
+          # 'FILE_INFO_BY_HANDLE_CLASS'` while compiling src/base/cpu/
+          # cpu.cc, nothing to do with cpu.cc itself.
+          #
+          # Chromium's own history backs this up: a 2026-08-29 fetch of
+          # chromium/src/build's *current* upstream build/config/win/
+          # BUILD.gn sets NTDDI_VERSION=NTDDI_WIN10_VB, an older/safer
+          # baseline - not WIN11_BR or even WIN11_GE - strong signal
+          # upstream walked this back after hitting the same class of
+          # SDK-header incompatibility. A separate Chromium tracker search
+          # found the intermediate step: NTDDI_WIN11_GE was chosen
+          # specifically because it "requires Windows 10.0.26100.0 SDK or
+          # higher" - i.e. 26100.0 was GE's own floor, and WIN11_BR (what
+          # V8 15.3's pinned `build` revision actually uses) is a step
+          # beyond that, needing an SDK newer than what's installed here.
+          # Independent reports (CPython/LLVM issue trackers) confirm
+          # "unknown type name" clang-cl breakage tied to SDK 10.0.26100.0
+          # header/macro mismatches generally - a known class of problem,
+          # not unique to this setup. References:
+          # https://chromium.googlesource.com/chromium/src/build/+/refs/heads/master/config/win/BUILD.gn
+          # https://issues.chromium.org/issues/41438438
+          #
+          # Fix: match current upstream's own already-reverted choice
+          # (NTDDI_WIN10_VB) rather than gamble on NTDDI_WIN11_GE being
+          # clean at exactly this SDK point-release - conservative, not
+          # verified against a full local Windows build (no Windows
+          # toolchain in the sandbox this was diagnosed from), so this is
+          # the first real CI signal on whether it's sufficient.
+          node -e "
+            const fs = require('fs');
+            const path = 'build/config/win/BUILD.gn';
+            let content = fs.readFileSync(path, 'utf8');
+            const re = /NTDDI_VERSION=NTDDI_WIN11_BR/;
+            const m = content.match(re);
+            if (!m) { console.error('NTDDI_VERSION PATCH TARGET NOT FOUND - build/config/win/BUILD.gn winver config has changed shape, aborting'); process.exit(1); }
+            content = content.replace(re, 'NTDDI_VERSION=NTDDI_WIN10_VB');
+            fs.writeFileSync(path, content);
+            console.log('patched NTDDI_VERSION from NTDDI_WIN11_BR (needs a newer SDK than 10.0.26100.0 provides) to NTDDI_WIN10_VB (matches current chromium/src/build upstream)');
+          "
+        working-directory: v8
+      - name: patch v8_monolith to depend on libc++ explicitly
+        run: |
+          # v8_monolith is a `static_library`, and Chromium's automatic
+          # libc++ dependency injection (build/config/BUILD.gn's
+          # common_deps group) only applies to executable/shared_library/
+          # loadable_module targets - confirmed directly in that file's
+          # own comments ("Only the executable template in
+          # BUILDCONFIG.gn should reference this", same wording for
+          # loadable_module/shared_library). static_library is never
+          # covered. That's fine for a normal Chromium build, where
+          # every static lib eventually gets linked into a real
+          # executable/shared_library *within the same build*, which is
+          # where libc++ actually gets pulled in - but v8_monolith is
+          # unusual: it's meant to be the final, self-contained artifact,
+          # consumed entirely outside this build (by repos/lo and any
+          # other embedder). Nothing in this graph ever triggers
+          # common_deps, so libc++'s compiled implementation objects
+          # never become a real dependency of v8_monolith at all, even
+          # though `complete_static_lib` would happily fold them in if
+          # they were. Real, reproducible symptom without this: dozens
+          # of genuine LNK2019/LNK2001 unresolved externals at final
+          # link time for libc++ runtime symbols (std::__Cr::__sort,
+          # mutex::lock/unlock, locale internals, regex internals,
+          # basic_string members, etc) - not caught by V8's own CI since
+          # producing a static archive never does symbol resolution.
+          # Minimal patch: make v8_monolith depend on libc++ explicitly,
+          # same guard common_deps itself uses.
+          node -e "
+            const fs = require('fs');
+            const path = 'BUILD.gn';
+            let content = fs.readFileSync(path, 'utf8');
+            const re = /(v8_static_library\(\"v8_monolith\"\)\s*\{\s*deps\s*=\s*\[[\s\S]*?\"\/\/build\/win:default_exe_manifest\",\s*\n\s*\])/;
+            const m = content.match(re);
+            if (!m) { console.error('PATCH TARGET NOT FOUND - v8_monolith deps block has changed shape, aborting'); process.exit(1); }
+            const patched = m[1] + '\n    if (use_custom_libcxx) {\n      deps += [ \"//buildtools/third_party/libc++\" ]\n    }';
+            content = content.replace(re, patched);
+            fs.writeFileSync(path, content);
+            console.log('patched v8_monolith to depend on //buildtools/third_party/libc++ when use_custom_libcxx');
+          "
+          # First attempt at this patch (this session) missed a second
+          # piece: the libc++ target itself restricts who's allowed to
+          # depend on it via GN's own `visibility` mechanism -
+          # confirmed directly, already seen once earlier this session
+          # while investigating the missing-dependency root cause, just
+          # not connected back to this patch at the time. Real,
+          # reproducible failure without this second half:
+          # "ERROR at //build/config/BUILDCONFIG.gn:556:5: Dependency
+          # not allowed." at `gn gen`, before any compilation - the
+          # deps addition above is syntactically fine but GN itself
+          # rejects it. v8_monolith is defined in this file's own
+          # top-level BUILD.gn, so its label is //:v8_monolith.
+          node -e "
+            const fs = require('fs');
+            const path = 'buildtools/third_party/libc++/BUILD.gn';
+            let content = fs.readFileSync(path, 'utf8');
+            const re = /(visibility\s*=\s*\[\s*\"\/\/build\/config:common_deps\",\s*\n\s*\"\/\/third_party\/catapult\/devil\",\s*\n\s*\])/;
+            const m = content.match(re);
+            if (!m) { console.error('VISIBILITY PATCH TARGET NOT FOUND - libc++ BUILD.gn visibility block has changed shape, aborting'); process.exit(1); }
+            const patched = m[1] + '\n  visibility += [ \"//:v8_monolith\" ]';
+            content = content.replace(re, patched);
+            fs.writeFileSync(path, content);
+            console.log('patched libc++ visibility to allow //:v8_monolith to depend on it');
+          "
+        working-directory: v8
+      - name: compile v8 static library
+        shell: pwsh
+        run: |
+          New-Item -ItemType directory -Path v8/out.gn/${{ matrix.platform }}.release/
+          Copy-Item "args.win.${{ matrix.platform }}.gn" -Destination "v8/out.gn/${{ matrix.platform }}.release/args.gn" -force
+          Set-Location -Path v8
+          # PowerShell does NOT propagate a native (non-cmdlet) command's
+          # nonzero exit code as script/step failure by default - unlike
+          # bash, if `ninja` here fails, PowerShell just continues to the
+          # next line, and the step's own reported exit code reflects only
+          # the LAST command run (`gn args --list`, which trivially
+          # succeeds even though v8_monolith.lib was never produced). Real
+          # CI incident (2026-08-22): a genuine ninja compile failure got
+          # silently swallowed this way, and the workflow proceeded to
+          # "compress artifacts", which failed instead with a confusing
+          # "path does not exist" - masking the real error. Explicit
+          # $LASTEXITCODE checks after each native command are the
+          # standard fix; $ErrorActionPreference doesn't help here, it
+          # only affects PowerShell cmdlets' own terminating errors, not
+          # native executables' exit codes at all.
+          gn gen out.gn/${{ matrix.platform }}.release
+          if ($LASTEXITCODE -ne 0) { Write-Error "gn gen failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+          ninja v8_monolith -C out.gn/${{ matrix.platform }}.release/
+          if ($LASTEXITCODE -ne 0) { Write-Error "ninja failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+          gn args --list out.gn/${{ matrix.platform }}.release
+          if ($LASTEXITCODE -ne 0) { Write-Error "gn args --list failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+      - name: compress artifacts
+        shell: pwsh
+        run: |
+          Compress-Archive -Path ${{ github.workspace }}/v8/out.gn/${{ matrix.platform }}.release/obj/v8_monolith.lib -Destination ${{ github.workspace }}/libv8_monolith-win-${{ matrix.platform }}.zip
+          Compress-Archive -Path ${{ github.workspace }}/v8/out.gn/${{ matrix.platform }}.release/gen -Destination ${{ github.workspace }}/gen-win-${{ matrix.platform }}.zip
+      # Public headers, the one artifact every embedder needs alongside
+      # v8_monolith.lib. Name kept as include.tar.gz (rather than a win-
+      # prefixed .zip) so this stays a drop-in replacement for the asset
+      # the linux job used to publish - consumers pin the asset name, not
+      # the job that produced it.
+      - name: package headers
+        working-directory: v8
+        run: |
+          tar -czf ${{ github.workspace }}/include.tar.gz include
+      - name: package libc++ headers
+        shell: pwsh
+        run: |
+          # args.win.${{ matrix.platform }}.gn sets use_custom_libcxx=true,
+          # so v8_monolith.lib was compiled against this exact vendored
+          # libc++, not MSVC's own STL (see C++.md entry 2) - consumers
+          # like repos/lo need the matching headers to link cleanly
+          # against it. Two separate locations, confirmed directly
+          # against Chromium's own build/config/c++/BUILD.gn:
+          #  - third_party/libc++/src/include: the actual STL headers,
+          #    added via a plain -I flag.
+          #  - buildtools/third_party/libc++/{__config_site,
+          #    __assertion_handler}: two loose ABI-config headers next
+          #    to libc++'s own BUILD.gn, added via a separate directory
+          #    -I flag (confirmed via GitHub's contents listing for that
+          #    directory - nothing else there is a header).
+          # Preserving this relative layout in the archive means a
+          # consumer's -I flags can point at the same two paths
+          # unmodified.
+          New-Item -ItemType Directory -Path staging/third_party/libc++/src -Force | Out-Null
+          Copy-Item -Recurse -Path ${{ github.workspace }}/v8/third_party/libc++/src/include -Destination staging/third_party/libc++/src/include
+          New-Item -ItemType Directory -Path staging/buildtools/third_party/libc++ -Force | Out-Null
+          Copy-Item -Path ${{ github.workspace }}/v8/buildtools/third_party/libc++/__config_site,${{ github.workspace }}/v8/buildtools/third_party/libc++/__assertion_handler -Destination staging/buildtools/third_party/libc++/
+          Compress-Archive -Path staging/* -Destination ${{ github.workspace }}/libcxx-headers-win-${{ matrix.platform }}.zip
+      - name: Upload headers
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/include.tar.gz
+          name: include.tar.gz
+      - name: Upload static library
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/libv8_monolith-win-${{ matrix.platform }}.zip
+          name: libv8_monolith-win-${{ matrix.platform }}.zip
+      - name: Upload generated source
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/gen-win-${{ matrix.platform }}.zip
+          name: gen-win-${{ matrix.platform }}.zip
+      - name: Upload libc++ headers
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{ github.workspace }}/libcxx-headers-win-${{ matrix.platform }}.zip
+          name: libcxx-headers-win-${{ matrix.platform }}.zip
